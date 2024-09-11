@@ -102,10 +102,10 @@ public:
 
     for (uint32_t i = 0; i < 2; ++i) {
       if (auto *constant = dyn_cast<ConstantData>(operands[i])) {
-        out << toSmtExpr(constant) << (i ? ")\n" : " ");
+        out << toSmtExpr(constant) << (i ? "))\n" : " ");
       } else if (auto *inst = dyn_cast<Instruction>(operands[i])) {
         out << "|%" << slot_tracker.getLocalSlot(inst) << "|"
-            << (i ? ")\n" : " ");
+            << (i ? "))\n" : " ");
       } else {
         throw std::runtime_error("Unsupported operand type");
       }
@@ -125,12 +125,12 @@ public:
     for (Function &f : m) {
       errs() << "Processing function: " << f.getName() << "\n";
       mst.incorporateFunction(f);
-      
+
       std::string filename = (f.getName() + ".smt2").str();
       std::error_code ec;
       raw_fd_ostream out(filename, ec, sys::fs::OF_Text);
 
-      llvm2smtVisitor visitor(errs(), mst);
+      llvm2smtVisitor visitor(out, mst);
       visitor.visit(f);
     }
 
