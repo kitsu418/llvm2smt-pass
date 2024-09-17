@@ -7,89 +7,301 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
-#include <cstdint>
 #include <string>
-#include <system_error>
+
+#include <z3++.h>
 
 using namespace llvm;
 
 namespace {
 
-std::string toSmtType(Type *type) {
-  if (type->isIntegerTy()) {
-    return "(_ BitVec " + std::to_string(type->getIntegerBitWidth()) + ")";
-  } else {
-    throw std::runtime_error("Unsupported type");
+class InstructionException : public std::runtime_error {
+public:
+  InstructionException(const char *msg, const Value *v = nullptr)
+      : std::runtime_error(msg) {
+    raw_string_ostream os(_msg);
+    os << msg << ": ";
+    if (v) {
+      v->print(os);
+    } else {
+      os << "Unknown instruction";
+    }
+    os << "\n";
   }
-}
 
-std::string toSmtExpr(ConstantData *constant) {
-  if (constant->getType()->isIntegerTy()) {
-    auto width = constant->getType()->getIntegerBitWidth();
-    return "(_ bv" +
-           std::to_string(
-               constant->getUniqueInteger().getLimitedValue(1 << width)) +
-           " " + std::to_string(width) + ")";
-  } else {
-    throw std::runtime_error("Unsupported constant type");
+  virtual const char *what() const noexcept override { return _msg.c_str(); }
+
+private:
+  std::string _msg;
+};
+
+class LiveVariableAnalysis {
+public:
+  void analyze_function(Function &fun) noexcept {
+    for (auto &bb : fun) {
+      in[&bb] = {};
+      out[&bb] = {};
+    }
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+
+      for (auto &bb : llvm::reverse(fun)) {
+        std::set<Value *> new_out = {};
+
+        // out[B] = \bigcup_\text{S a successor of B} in[S]
+        for (auto succ : successors(&bb)) {
+          for (auto v : in[succ]) {
+            new_out.insert(v);
+          }
+        }
+
+        // in[B] = use(B) \cup (out[B] - def(B))
+        std::set<Value *> new_in = new_out;
+        for (auto &inst : llvm::reverse(bb)) {
+          new_in.erase(&inst);
+          for (auto &use : inst.operands()) {
+            if (isa<Instruction>(use) || isa<Argument>(use)) {
+              new_in.insert(use);
+            }
+          }
+        }
+
+        if (new_in != in[&bb] || new_out != out[&bb]) {
+          std::swap(in[&bb], new_in);
+          std::swap(out[&bb], new_out);
+          changed = true;
+        }
+      }
+    }
   }
-}
+
+  const std::set<Value *> &get_in(BasicBlock *bb) const { return in.at(bb); }
+
+  LiveVariableAnalysis(Function &fun) { analyze_function(fun); }
+  ~LiveVariableAnalysis() = default;
+
+private:
+  std::map<BasicBlock *, std::set<Value *>> in{};
+  std::map<BasicBlock *, std::set<Value *>> out{};
+};
+
+class Context {
+public:
+  Context(Module *m)
+      : fp(z3::fixedpoint(ctx)), slot_tracker(ModuleSlotTracker(m)) {
+    for (auto &f : *m) {
+      if (f.isDeclaration()) {
+        continue;
+      }
+
+      live_vars_map.insert({&f, LiveVariableAnalysis(f)});
+      const auto &lva = live_vars_map.at(&f);
+
+      for (auto &bb : f) {
+        if (f.isDeclaration()) {
+          continue;
+        }
+        slot_tracker.incorporateFunction(f);
+
+        z3::sort_vector domain(ctx);
+
+        for (auto var : lva.get_in(&bb)) {
+          if (var->getType()->isIntegerTy()) {
+            domain.push_back(ctx.bv_sort(var->getType()->getIntegerBitWidth()));
+          } else {
+            throw InstructionException("Unsupported type", var);
+          }
+        }
+
+        relation_map.insert(
+            {&bb, ctx.function(get_value_name(&bb, bb.getParent()).c_str(),
+                               domain, ctx.bool_sort())});
+        fp.register_relation(relation_map.at(&bb));
+      }
+    }
+  }
+
+  z3::expr get_z3_expr(Value *v, Function *f, bool is_signed = true) {
+    auto it = value_map.find(v);
+    if (it != value_map.end()) {
+      return it->second;
+    }
+    if (auto *constant = dyn_cast<Constant>(v)) {
+      if (auto constant_int = dyn_cast<ConstantInt>(constant)) {
+        auto width = constant_int->getType()->getIntegerBitWidth();
+        z3::expr e = ctx.bv_val(is_signed ? constant_int->getSExtValue()
+                                          : constant_int->getZExtValue(),
+                                width);
+        value_map.insert({v, std::move(e)});
+        return value_map.at(v);
+      } else {
+        throw InstructionException("Unsupported type", v);
+      }
+    } else if (auto *inst = dyn_cast<Instruction>(v)) {
+      if (v->getType()->isIntegerTy()) {
+        auto width = v->getType()->getIntegerBitWidth();
+        z3::expr e = ctx.bv_const(get_value_name(v, f).c_str(), width);
+        value_map.insert({v, std::move(e)});
+        return value_map.at(v);
+      } else {
+        throw InstructionException("Unsupported type", v);
+      }
+    } else if (auto *arg = dyn_cast<Argument>(v)) {
+      if (v->getType()->isIntegerTy()) {
+        auto width = v->getType()->getIntegerBitWidth();
+        z3::expr e = ctx.bv_const(get_value_name(v, f).c_str(), width);
+        value_map.insert({v, std::move(e)});
+        return value_map.at(v);
+      } else {
+        throw InstructionException("Unsupported type", v);
+      }
+    } else {
+      throw InstructionException("Unsupported type", v);
+    }
+  }
+
+  void update_value_map(Value *v, z3::expr &&e) {
+    value_map.insert({v, std::move(e)});
+  }
+
+  bool has_value(Value *v) const noexcept {
+    return value_map.count(v) > 0;
+  }
+
+  z3::context &get_context() noexcept { return ctx; }
+
+  std::string get_value_name(Value *v, Function *f) noexcept {
+    if (auto *bb = dyn_cast<BasicBlock>(v)) {
+      return f->getName().str() + "#" +
+             std::to_string((slot_tracker.getLocalSlot(bb)));
+    } else {
+      return f->getName().str() + "%" +
+             std::to_string((slot_tracker.getLocalSlot(v)));
+    }
+  }
+
+  void incorporate_function(const Function &f) {
+    slot_tracker.incorporateFunction(f);
+  }
+
+  z3::expr_vector get_horn_clause(BasicBlock &bb) {
+    z3::expr_vector clauses(ctx);
+    z3::expr_vector body(ctx);
+    const auto &lva = live_vars_map.at(bb.getParent());
+
+    z3::expr_vector domain(ctx);
+    for (auto lv : lva.get_in(&bb)) {
+      if (lv->getType()->isIntegerTy()) {
+        auto width = lv->getType()->getIntegerBitWidth();
+        domain.push_back(
+            ctx.bv_const(get_value_name(lv, bb.getParent()).c_str(), width));
+      } else {
+        throw InstructionException("Unsupported type", lv);
+      }
+    }
+    body.push_back(relation_map.at(&bb)(std::move(domain)));
+
+    for (auto &inst : bb) {
+      if (has_value(&inst)) {
+        inst.print(errs());
+        auto type = inst.getType();
+        if (type->isIntegerTy()) {
+          auto rhs = get_z3_expr(&inst, bb.getParent());
+          auto width = type->getIntegerBitWidth();
+          auto lhs = ctx.bv_const(get_value_name(&inst, bb.getParent()).c_str(),
+                                  width);
+          body.push_back(lhs == rhs);
+        } else {
+          throw InstructionException("Unsupported type", &inst);
+        }
+      }
+    }
+
+    auto body_and = z3::mk_and(body);
+
+    for (auto succ : successors(&bb)) {
+      z3::expr_vector head_args(ctx);
+      for (auto var : lva.get_in(succ)) {
+        if (var->getType()->isIntegerTy()) {
+          auto width = var->getType()->getIntegerBitWidth();
+          head_args.push_back(
+              ctx.bv_const(get_value_name(var, bb.getParent()).c_str(), width));
+        } else {
+          throw InstructionException("Unsupported type", var);
+        }
+      }
+
+      clauses.push_back(z3::implies(
+          std::move(body_and), relation_map.at(succ)(std::move(head_args))));
+    }
+    bb.print(errs());
+
+    return clauses;
+  }
+
+private:
+  z3::context ctx{};
+  z3::fixedpoint fp;
+  std::map<Value *, z3::expr> value_map{};
+  ModuleSlotTracker slot_tracker;
+  std::map<BasicBlock *, z3::func_decl> relation_map{};
+  std::map<Function *, LiveVariableAnalysis> live_vars_map{};
+};
 
 class llvm2smtVisitor : public InstVisitor<llvm2smtVisitor> {
 public:
-  llvm2smtVisitor(raw_ostream &o, ModuleSlotTracker &tracker)
-      : out(o), slot_tracker(tracker) {}
+  llvm2smtVisitor(Context &c) : ctx(c) {}
 
   void visitBinaryOperator(BinaryOperator &I) {
     assert(I.getNumOperands() == 2);
-    std::array<Value *, 2> operands = {I.getOperand(0), I.getOperand(1)};
-    assert(operands[0]->getType() == operands[1]->getType());
+    auto op1 = I.getOperand(0);
+    auto op2 = I.getOperand(1);
+    assert(op1->getType() == op2->getType());
 
-    out << ";;";
-    I.print(out);
-
-    out << "\n(define-fun |%" << slot_tracker.getLocalSlot(&I) << "| () "
-        << toSmtType(operands[0]->getType()) << " (";
+    auto expr1 = ctx.get_z3_expr(op1, I.getFunction(), !I.hasNoSignedWrap());
+    auto expr2 = ctx.get_z3_expr(op2, I.getFunction(), !I.hasNoSignedWrap());
 
     switch (I.getOpcode()) {
     case Instruction::Add:
-      out << "bvadd ";
+      ctx.update_value_map(&I, expr1 + expr2);
       break;
     case Instruction::Sub:
-      out << "bvsub ";
+      ctx.update_value_map(&I, expr1 - expr2);
       break;
     case Instruction::Mul:
-      out << "bvmul ";
+      ctx.update_value_map(&I, expr1 * expr2);
       break;
     case Instruction::UDiv:
-      out << "bvudiv ";
+      ctx.update_value_map(&I, z3::udiv(expr1, expr2));
       break;
     case Instruction::SDiv:
-      out << "bvsdiv ";
+      ctx.update_value_map(&I, expr1 / expr2);
       break;
     case Instruction::URem:
-      out << "bvurem ";
+      ctx.update_value_map(&I, z3::urem(expr1, expr2));
       break;
     case Instruction::SRem:
-      out << "bvsrem ";
+      ctx.update_value_map(&I, z3::srem(expr1, expr2));
       break;
     case Instruction::Shl:
-      out << "bvshl ";
+      ctx.update_value_map(&I, z3::shl(expr1, expr2));
       break;
     case Instruction::LShr:
-      out << "bvlshr ";
+      ctx.update_value_map(&I, z3::lshr(expr1, expr2));
       break;
     case Instruction::AShr:
-      out << "bvashr ";
+      ctx.update_value_map(&I, z3::ashr(expr1, expr2));
       break;
     case Instruction::And:
-      out << "bvand ";
+      ctx.update_value_map(&I, expr1 & expr2);
       break;
     case Instruction::Or:
-      out << "bvor ";
+      ctx.update_value_map(&I, expr1 | expr2);
       break;
     case Instruction::Xor:
-      out << "bvxor ";
+      ctx.update_value_map(&I, expr1 ^ expr2);
       break;
     case Instruction::FAdd:
     case Instruction::FSub:
@@ -97,41 +309,48 @@ public:
     case Instruction::FDiv:
     case Instruction::FRem:
     default:
+      throw InstructionException("Unsupported instruction", &I);
       break;
     }
+  }
 
-    for (uint32_t i = 0; i < 2; ++i) {
-      if (auto *constant = dyn_cast<ConstantData>(operands[i])) {
-        out << toSmtExpr(constant) << (i ? "))\n" : " ");
-      } else if (auto *inst = dyn_cast<Instruction>(operands[i])) {
-        out << "|%" << slot_tracker.getLocalSlot(inst) << "|"
-            << (i ? "))\n" : " ");
-      } else {
-        throw std::runtime_error("Unsupported operand type");
-      }
+  void visitInstruction(Instruction &I) {
+    if (I.isBinaryOp()) {
+      visitBinaryOperator(cast<BinaryOperator>(I));
+    } else {
+      throw InstructionException("Unsupported instruction", &I);
     }
   }
 
 private:
-  raw_ostream &out;
-  ModuleSlotTracker &slot_tracker;
+  Context &ctx;
 };
 
 class llvm2SmtPass : public PassInfoMixin<llvm2SmtPass> {
 public:
   PreservedAnalyses run(Module &m, ModuleAnalysisManager &mam) {
-    ModuleSlotTracker mst(&m);
+    Context ctx(&m);
 
     for (Function &f : m) {
       errs() << "Processing function: " << f.getName() << "\n";
-      mst.incorporateFunction(f);
+      ctx.incorporate_function(f);
 
       std::string filename = (f.getName() + ".smt2").str();
       std::error_code ec;
       raw_fd_ostream out(filename, ec, sys::fs::OF_Text);
 
-      llvm2smtVisitor visitor(out, mst);
-      visitor.visit(f);
+      llvm2smtVisitor visitor(ctx);
+
+      try {
+        visitor.visit(f);
+      } catch (InstructionException &e) {
+        errs() << e.what();
+      }
+
+      for (auto &bb : f) {
+        auto clauses = ctx.get_horn_clause(bb);
+        errs() << clauses.to_string() << "\n";
+      }
     }
 
     return PreservedAnalyses::all();

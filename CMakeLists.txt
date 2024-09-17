@@ -3,10 +3,13 @@ project(LLVM2Smt)
 
 # LLVM uses C++17.
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Load LLVMConfig.cmake. If this fails, consider setting `LLVM_DIR` to point
 # to your LLVM installation's `lib/cmake/llvm` directory.
 find_package(LLVM REQUIRED CONFIG)
+find_package(Z3 REQUIRED)
+include_directories(${Z3_INCLUDE_DIR})
 
 # Include the part of LLVM's CMake libraries that defines
 # `add_llvm_pass_plugin`.
