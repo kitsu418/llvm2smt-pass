@@ -218,23 +218,28 @@ public:
     body.push_back(relation_map.at(&bb)(std::move(domain)));
 
     for (auto &inst : bb) {
-      if (has_value(&inst)) {
-        auto type = inst.getType();
-        if (type->isIntegerTy()) {
-          auto rhs = get_z3_expr(&inst, bb.getParent());
-          auto width = type->getIntegerBitWidth();
-          auto lhs =
-              width == 1
-                  ? ctx.bool_const(
-                        get_value_name(&inst, bb.getParent()).c_str())
-                  : ctx.bv_const(get_value_name(&inst, bb.getParent()).c_str(),
-                                 width);
-          body.push_back(lhs == rhs);
-        } else if (type->isVoidTy()) {
-          continue;
-        } else {
-          ERROR("Unsupported type", &inst);
+      try {
+        if (has_value(&inst)) {
+          auto type = inst.getType();
+          if (type->isIntegerTy()) {
+            auto rhs = get_z3_expr(&inst, bb.getParent());
+            auto width = type->getIntegerBitWidth();
+            auto lhs =
+                width == 1
+                    ? ctx.bool_const(
+                          get_value_name(&inst, bb.getParent()).c_str())
+                    : ctx.bv_const(
+                          get_value_name(&inst, bb.getParent()).c_str(), width);
+            body.push_back(lhs == rhs);
+          } else if (type->isVoidTy()) {
+            continue;
+          } else {
+            ERROR("Unsupported type", &inst);
+          }
         }
+      } catch (z3::exception &e) {
+        errs() << e.msg() << "\n";
+        ERROR("Z3 Exception", &inst);
       }
     }
 
@@ -303,55 +308,65 @@ public:
     auto expr2 =
         ctx.get_z3_expr(op2, inst.getFunction(), !inst.hasNoSignedWrap());
 
-    switch (inst.getOpcode()) {
-    case Instruction::Add:
-      ctx.update_value_map(&inst, expr1 + expr2);
-      break;
-    case Instruction::Sub:
-      ctx.update_value_map(&inst, expr1 - expr2);
-      break;
-    case Instruction::Mul:
-      ctx.update_value_map(&inst, expr1 * expr2);
-      break;
-    case Instruction::UDiv:
-      ctx.update_value_map(&inst, z3::udiv(expr1, expr2));
-      break;
-    case Instruction::SDiv:
-      ctx.update_value_map(&inst, expr1 / expr2);
-      break;
-    case Instruction::URem:
-      ctx.update_value_map(&inst, z3::urem(expr1, expr2));
-      break;
-    case Instruction::SRem:
-      ctx.update_value_map(&inst, z3::srem(expr1, expr2));
-      break;
-    case Instruction::Shl:
-      ctx.update_value_map(&inst, z3::shl(expr1, expr2));
-      break;
-    case Instruction::LShr:
-      ctx.update_value_map(&inst, z3::lshr(expr1, expr2));
-      break;
-    case Instruction::AShr:
-      ctx.update_value_map(&inst, z3::ashr(expr1, expr2));
-      break;
-    case Instruction::And:
-      ctx.update_value_map(&inst, expr1 & expr2);
-      break;
-    case Instruction::Or:
-      ctx.update_value_map(&inst, expr1 | expr2);
-      break;
-    case Instruction::Xor:
-      ctx.update_value_map(&inst, expr1 ^ expr2);
-      break;
-    case Instruction::FAdd:
-    case Instruction::FSub:
-    case Instruction::FMul:
-    case Instruction::FDiv:
-    case Instruction::FRem:
-    default:
-      ERROR("Unsupported instruction", &inst);
-      break;
+    try {
+      switch (inst.getOpcode()) {
+      case Instruction::Add:
+        ctx.update_value_map(&inst, expr1 + expr2);
+        break;
+      case Instruction::Sub:
+        ctx.update_value_map(&inst, expr1 - expr2);
+        break;
+      case Instruction::Mul:
+        ctx.update_value_map(
+            &inst, (expr1 * expr2)
+                       .extract(op1->getType()->getIntegerBitWidth() - 1, 0));
+        break;
+      case Instruction::UDiv:
+        ctx.update_value_map(&inst, z3::udiv(expr1, expr2));
+        break;
+      case Instruction::SDiv:
+        ctx.update_value_map(&inst, expr1 / expr2);
+        break;
+      case Instruction::URem:
+        ctx.update_value_map(&inst, z3::urem(expr1, expr2));
+        break;
+      case Instruction::SRem:
+        ctx.update_value_map(&inst, z3::srem(expr1, expr2));
+        break;
+      case Instruction::Shl:
+        ctx.update_value_map(&inst, z3::shl(expr1, expr2));
+        break;
+      case Instruction::LShr:
+        ctx.update_value_map(&inst, z3::lshr(expr1, expr2));
+        break;
+      case Instruction::AShr:
+        ctx.update_value_map(&inst, z3::ashr(expr1, expr2));
+        break;
+      case Instruction::And:
+        ctx.update_value_map(&inst, expr1 & expr2);
+        break;
+      case Instruction::Or:
+        ctx.update_value_map(&inst, expr1 | expr2);
+        break;
+      case Instruction::Xor:
+        ctx.update_value_map(&inst, expr1 ^ expr2);
+        break;
+      case Instruction::FAdd:
+      case Instruction::FSub:
+      case Instruction::FMul:
+      case Instruction::FDiv:
+      case Instruction::FRem:
+        ERROR("Unsupported instruction", &inst);
+        break;
+      default:
+        ERROR("Unknown instruction", &inst);
+        break;
+      }
+    } catch (z3::exception &e) {
+      errs() << e.msg() << "\n";
+      ERROR("Z3 Exception", &inst);
     }
+    errs() << ctx.get_z3_expr(&inst, inst.getFunction()).to_string() << "\n";
   }
 
   void visitICmp(ICmpInst &inst) {
@@ -365,64 +380,124 @@ public:
     auto expr2 =
         ctx.get_z3_expr(op2, inst.getFunction(), !inst.hasNoSignedWrap());
 
-    switch (inst.getPredicate()) {
-    case CmpInst::ICMP_EQ:
-      ctx.update_value_map(&inst, expr1 == expr2);
-      break;
-    case CmpInst::ICMP_NE:
-      ctx.update_value_map(&inst, expr1 != expr2);
-      break;
-    case CmpInst::ICMP_UGT:
-      ctx.update_value_map(&inst, z3::ugt(expr1, expr2));
-      break;
-    case CmpInst::ICMP_UGE:
-      ctx.update_value_map(&inst, z3::uge(expr1, expr2));
-      break;
-    case CmpInst::ICMP_ULT:
-      ctx.update_value_map(&inst, z3::ult(expr1, expr2));
-      break;
-    case CmpInst::ICMP_ULE:
-      ctx.update_value_map(&inst, z3::ule(expr1, expr2));
-      break;
-    case CmpInst::ICMP_SGT:
-      ctx.update_value_map(&inst, z3::sgt(expr1, expr2));
-      break;
-    case CmpInst::ICMP_SGE:
-      ctx.update_value_map(&inst, z3::sge(expr1, expr2));
-      break;
-    case CmpInst::ICMP_SLT:
-      ctx.update_value_map(&inst, z3::slt(expr1, expr2));
-      break;
-    case CmpInst::ICMP_SLE:
-      ctx.update_value_map(&inst, z3::sle(expr1, expr2));
-      break;
-    case CmpInst::FCMP_FALSE:
-    case CmpInst::FCMP_OEQ:
-    case CmpInst::FCMP_OGT:
-    case CmpInst::FCMP_OGE:
-    case CmpInst::FCMP_OLT:
-    case CmpInst::FCMP_OLE:
-    case CmpInst::FCMP_ONE:
-    case CmpInst::FCMP_ORD:
-    case CmpInst::FCMP_UNO:
-    case CmpInst::FCMP_UEQ:
-    case CmpInst::FCMP_UGT:
-    case CmpInst::FCMP_UGE:
-    case CmpInst::FCMP_ULT:
-    case CmpInst::FCMP_ULE:
-    case CmpInst::FCMP_UNE:
-    case CmpInst::FCMP_TRUE:
-      ERROR("Unsupported predicate", &inst);
-      break;
-    case CmpInst::BAD_FCMP_PREDICATE:
-    case CmpInst::BAD_ICMP_PREDICATE:
-      ERROR("Bad predicate", &inst);
-      break;
+    try {
+      switch (inst.getPredicate()) {
+      case CmpInst::ICMP_EQ:
+        ctx.update_value_map(&inst, expr1 == expr2);
+        break;
+      case CmpInst::ICMP_NE:
+        ctx.update_value_map(&inst, expr1 != expr2);
+        break;
+      case CmpInst::ICMP_UGT:
+        ctx.update_value_map(&inst, z3::ugt(expr1, expr2));
+        break;
+      case CmpInst::ICMP_UGE:
+        ctx.update_value_map(&inst, z3::uge(expr1, expr2));
+        break;
+      case CmpInst::ICMP_ULT:
+        ctx.update_value_map(&inst, z3::ult(expr1, expr2));
+        break;
+      case CmpInst::ICMP_ULE:
+        ctx.update_value_map(&inst, z3::ule(expr1, expr2));
+        break;
+      case CmpInst::ICMP_SGT:
+        ctx.update_value_map(&inst, z3::sgt(expr1, expr2));
+        break;
+      case CmpInst::ICMP_SGE:
+        ctx.update_value_map(&inst, z3::sge(expr1, expr2));
+        break;
+      case CmpInst::ICMP_SLT:
+        ctx.update_value_map(&inst, z3::slt(expr1, expr2));
+        break;
+      case CmpInst::ICMP_SLE:
+        ctx.update_value_map(&inst, z3::sle(expr1, expr2));
+        break;
+      case CmpInst::FCMP_FALSE:
+      case CmpInst::FCMP_OEQ:
+      case CmpInst::FCMP_OGT:
+      case CmpInst::FCMP_OGE:
+      case CmpInst::FCMP_OLT:
+      case CmpInst::FCMP_OLE:
+      case CmpInst::FCMP_ONE:
+      case CmpInst::FCMP_ORD:
+      case CmpInst::FCMP_UNO:
+      case CmpInst::FCMP_UEQ:
+      case CmpInst::FCMP_UGT:
+      case CmpInst::FCMP_UGE:
+      case CmpInst::FCMP_ULT:
+      case CmpInst::FCMP_ULE:
+      case CmpInst::FCMP_UNE:
+      case CmpInst::FCMP_TRUE:
+        ERROR("Unsupported predicate", &inst);
+        break;
+      default:
+        ERROR("Unknown predicate", &inst);
+        break;
+      }
+    } catch (z3::exception &e) {
+      errs() << e.msg() << "\n";
+      ERROR("Z3 Exception", &inst);
     }
   }
 
   void visitBranchInst(BranchInst &inst) {
-    ctx.update_value_map(&inst, ctx.get_context().bool_val(true));
+    // do nothing here
+  }
+
+  void visitCastInst(CastInst &inst) {
+    auto src = inst.getSrcTy();
+    auto dst = inst.getDestTy();
+    auto v = inst.getOperand(0);
+    if (v == nullptr) {
+      ERROR("Operand is null", &inst);
+    }
+    auto e = ctx.get_z3_expr(v, inst.getFunction(), !inst.hasNoSignedWrap());
+
+    switch (inst.getOpcode()) {
+    case Instruction::ZExt:
+      if (!v->getType()->isIntegerTy()) {
+        ERROR("Value is not Integer", v);
+      }
+      if (dst->getIntegerBitWidth() <= src->getIntegerBitWidth()) {
+        ERROR("Invalid cast", &inst);
+      }
+
+      ctx.update_value_map(&inst, z3::zext(e, (dst->getIntegerBitWidth() -
+                                               src->getIntegerBitWidth())));
+      break;
+    case Instruction::SExt:
+      if (!v->getType()->isIntegerTy()) {
+        ERROR("Value is not Integer", v);
+      }
+      if (dst->getIntegerBitWidth() <= src->getIntegerBitWidth()) {
+        ERROR("Invalid cast", &inst);
+      }
+
+      ctx.update_value_map(&inst, z3::sext(e, (dst->getIntegerBitWidth() -
+                                               src->getIntegerBitWidth())));
+      break;
+    case Instruction::Trunc:
+      if (dst->getIntegerBitWidth() >= src->getIntegerBitWidth()) {
+        ERROR("Invalid cast", &inst);
+      }
+      ctx.update_value_map(&inst, e.extract(dst->getIntegerBitWidth() - 1, 0));
+      break;
+    case Instruction::BitCast:
+    case Instruction::FPToUI:
+    case Instruction::FPToSI:
+    case Instruction::UIToFP:
+    case Instruction::SIToFP:
+    case Instruction::FPTrunc:
+    case Instruction::FPExt:
+    case Instruction::PtrToInt:
+    case Instruction::IntToPtr:
+    case Instruction::AddrSpaceCast:
+      ERROR("Unsupported Opcode", &inst);
+      break;
+    default:
+      ERROR("Unknown Opcode", &inst);
+      break;
+    }
   }
 
   void visitInstruction(Instruction &inst) {
