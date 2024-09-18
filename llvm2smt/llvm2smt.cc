@@ -17,10 +17,11 @@ namespace {
 
 class InstructionException : public std::runtime_error {
 public:
-  InstructionException(const char *msg, const Value *v = nullptr)
+  InstructionException(const char *msg, const Value *v = nullptr, int line = 0)
       : std::runtime_error(msg) {
     raw_string_ostream os(_msg);
-    os << msg << ": ";
+
+    os << msg << " at line " << line << ": ";
     if (v) {
       v->print(os);
     } else {
@@ -34,6 +35,11 @@ public:
 private:
   std::string _msg;
 };
+
+#define ERROR(msg, v)                                                          \
+  do {                                                                         \
+    throw InstructionException(msg, v, __LINE__);                              \
+  } while (0)
 
 class LiveVariableAnalysis {
 public:
@@ -109,9 +115,14 @@ public:
 
         for (auto var : lva.get_in(&bb)) {
           if (var->getType()->isIntegerTy()) {
-            domain.push_back(ctx.bv_sort(var->getType()->getIntegerBitWidth()));
+            if (var->getType()->getIntegerBitWidth() == 1) {
+              domain.push_back(ctx.bool_sort());
+            } else {
+              domain.push_back(
+                  ctx.bv_sort(var->getType()->getIntegerBitWidth()));
+            }
           } else {
-            throw InstructionException("Unsupported type", var);
+            // ERROR("Unsupported type", var);
           }
         }
 
@@ -128,37 +139,37 @@ public:
     if (it != value_map.end()) {
       return it->second;
     }
-    if (auto *constant = dyn_cast<Constant>(v)) {
-      if (auto constant_int = dyn_cast<ConstantInt>(constant)) {
+    if (isa<Constant>(v)) {
+      if (auto constant_int = dyn_cast<ConstantInt>(v)) {
         auto width = constant_int->getType()->getIntegerBitWidth();
-        z3::expr e = ctx.bv_val(is_signed ? constant_int->getSExtValue()
-                                          : constant_int->getZExtValue(),
-                                width);
-        value_map.insert({v, std::move(e)});
+        if (width == 1) {
+          value_map.insert(
+              {v, ctx.bool_val(constant_int->getZExtValue() != 0)});
+        } else {
+          value_map.insert(
+              {v, ctx.bv_val(is_signed ? constant_int->getSExtValue()
+                                       : constant_int->getZExtValue(),
+                             width)});
+        }
         return value_map.at(v);
       } else {
-        throw InstructionException("Unsupported type", v);
+        ERROR("Unsupported type", v);
       }
-    } else if (auto *inst = dyn_cast<Instruction>(v)) {
+    } else if (isa<Instruction>(v) || isa<Argument>(v)) {
       if (v->getType()->isIntegerTy()) {
         auto width = v->getType()->getIntegerBitWidth();
-        z3::expr e = ctx.bv_const(get_value_name(v, f).c_str(), width);
-        value_map.insert({v, std::move(e)});
+        if (width == 1) {
+          value_map.insert({v, ctx.bool_const(get_value_name(v, f).c_str())});
+        } else {
+          value_map.insert(
+              {v, ctx.bv_const(get_value_name(v, f).c_str(), width)});
+        }
         return value_map.at(v);
       } else {
-        throw InstructionException("Unsupported type", v);
-      }
-    } else if (auto *arg = dyn_cast<Argument>(v)) {
-      if (v->getType()->isIntegerTy()) {
-        auto width = v->getType()->getIntegerBitWidth();
-        z3::expr e = ctx.bv_const(get_value_name(v, f).c_str(), width);
-        value_map.insert({v, std::move(e)});
-        return value_map.at(v);
-      } else {
-        throw InstructionException("Unsupported type", v);
+        ERROR("Unsupported type", v);
       }
     } else {
-      throw InstructionException("Unsupported type", v);
+      ERROR("Unsupported type", v);
     }
   }
 
@@ -166,9 +177,7 @@ public:
     value_map.insert({v, std::move(e)});
   }
 
-  bool has_value(Value *v) const noexcept {
-    return value_map.count(v) > 0;
-  }
+  bool has_value(Value *v) const noexcept { return value_map.count(v) > 0; }
 
   z3::context &get_context() noexcept { return ctx; }
 
@@ -195,46 +204,75 @@ public:
     for (auto lv : lva.get_in(&bb)) {
       if (lv->getType()->isIntegerTy()) {
         auto width = lv->getType()->getIntegerBitWidth();
-        domain.push_back(
-            ctx.bv_const(get_value_name(lv, bb.getParent()).c_str(), width));
+        if (width == 1) {
+          domain.push_back(
+              ctx.bool_const(get_value_name(lv, bb.getParent()).c_str()));
+        } else {
+          domain.push_back(
+              ctx.bv_const(get_value_name(lv, bb.getParent()).c_str(), width));
+        }
       } else {
-        throw InstructionException("Unsupported type", lv);
+        ERROR("Unsupported type", lv);
       }
     }
     body.push_back(relation_map.at(&bb)(std::move(domain)));
 
     for (auto &inst : bb) {
       if (has_value(&inst)) {
-        inst.print(errs());
         auto type = inst.getType();
         if (type->isIntegerTy()) {
           auto rhs = get_z3_expr(&inst, bb.getParent());
           auto width = type->getIntegerBitWidth();
-          auto lhs = ctx.bv_const(get_value_name(&inst, bb.getParent()).c_str(),
-                                  width);
+          auto lhs =
+              width == 1
+                  ? ctx.bool_const(
+                        get_value_name(&inst, bb.getParent()).c_str())
+                  : ctx.bv_const(get_value_name(&inst, bb.getParent()).c_str(),
+                                 width);
           body.push_back(lhs == rhs);
+        } else if (type->isVoidTy()) {
+          continue;
         } else {
-          throw InstructionException("Unsupported type", &inst);
+          ERROR("Unsupported type", &inst);
         }
       }
     }
 
-    auto body_and = z3::mk_and(body);
+    auto terminatior = bb.getTerminator();
 
     for (auto succ : successors(&bb)) {
       z3::expr_vector head_args(ctx);
       for (auto var : lva.get_in(succ)) {
         if (var->getType()->isIntegerTy()) {
           auto width = var->getType()->getIntegerBitWidth();
-          head_args.push_back(
-              ctx.bv_const(get_value_name(var, bb.getParent()).c_str(), width));
+          if (width == 1) {
+            head_args.push_back(
+                ctx.bool_const(get_value_name(var, bb.getParent()).c_str()));
+          } else {
+            head_args.push_back(ctx.bv_const(
+                get_value_name(var, bb.getParent()).c_str(), width));
+          }
         } else {
-          throw InstructionException("Unsupported type", var);
+          ERROR("Unsupported type", var);
         }
       }
 
-      clauses.push_back(z3::implies(
-          std::move(body_and), relation_map.at(succ)(std::move(head_args))));
+      if (auto branch = dyn_cast<BranchInst>(terminatior)) {
+        if (branch->isConditional()) {
+          auto cond = branch->getCondition();
+          auto expr = get_z3_expr(cond, bb.getParent());
+          if (branch->getSuccessor(0) == succ) {
+            body.push_back(expr);
+          } else {
+            body.push_back(!expr);
+          }
+        }
+      }
+
+      clauses.push_back(
+          z3::implies(std::move(z3::mk_and(body)),
+                      relation_map.at(succ)(std::move(head_args))));
+      body.pop_back();
     }
     bb.print(errs());
 
@@ -254,54 +292,56 @@ class llvm2smtVisitor : public InstVisitor<llvm2smtVisitor> {
 public:
   llvm2smtVisitor(Context &c) : ctx(c) {}
 
-  void visitBinaryOperator(BinaryOperator &I) {
-    assert(I.getNumOperands() == 2);
-    auto op1 = I.getOperand(0);
-    auto op2 = I.getOperand(1);
+  void visitBinaryOperator(BinaryOperator &inst) {
+    assert(inst.getNumOperands() == 2);
+    auto op1 = inst.getOperand(0);
+    auto op2 = inst.getOperand(1);
     assert(op1->getType() == op2->getType());
 
-    auto expr1 = ctx.get_z3_expr(op1, I.getFunction(), !I.hasNoSignedWrap());
-    auto expr2 = ctx.get_z3_expr(op2, I.getFunction(), !I.hasNoSignedWrap());
+    auto expr1 =
+        ctx.get_z3_expr(op1, inst.getFunction(), !inst.hasNoSignedWrap());
+    auto expr2 =
+        ctx.get_z3_expr(op2, inst.getFunction(), !inst.hasNoSignedWrap());
 
-    switch (I.getOpcode()) {
+    switch (inst.getOpcode()) {
     case Instruction::Add:
-      ctx.update_value_map(&I, expr1 + expr2);
+      ctx.update_value_map(&inst, expr1 + expr2);
       break;
     case Instruction::Sub:
-      ctx.update_value_map(&I, expr1 - expr2);
+      ctx.update_value_map(&inst, expr1 - expr2);
       break;
     case Instruction::Mul:
-      ctx.update_value_map(&I, expr1 * expr2);
+      ctx.update_value_map(&inst, expr1 * expr2);
       break;
     case Instruction::UDiv:
-      ctx.update_value_map(&I, z3::udiv(expr1, expr2));
+      ctx.update_value_map(&inst, z3::udiv(expr1, expr2));
       break;
     case Instruction::SDiv:
-      ctx.update_value_map(&I, expr1 / expr2);
+      ctx.update_value_map(&inst, expr1 / expr2);
       break;
     case Instruction::URem:
-      ctx.update_value_map(&I, z3::urem(expr1, expr2));
+      ctx.update_value_map(&inst, z3::urem(expr1, expr2));
       break;
     case Instruction::SRem:
-      ctx.update_value_map(&I, z3::srem(expr1, expr2));
+      ctx.update_value_map(&inst, z3::srem(expr1, expr2));
       break;
     case Instruction::Shl:
-      ctx.update_value_map(&I, z3::shl(expr1, expr2));
+      ctx.update_value_map(&inst, z3::shl(expr1, expr2));
       break;
     case Instruction::LShr:
-      ctx.update_value_map(&I, z3::lshr(expr1, expr2));
+      ctx.update_value_map(&inst, z3::lshr(expr1, expr2));
       break;
     case Instruction::AShr:
-      ctx.update_value_map(&I, z3::ashr(expr1, expr2));
+      ctx.update_value_map(&inst, z3::ashr(expr1, expr2));
       break;
     case Instruction::And:
-      ctx.update_value_map(&I, expr1 & expr2);
+      ctx.update_value_map(&inst, expr1 & expr2);
       break;
     case Instruction::Or:
-      ctx.update_value_map(&I, expr1 | expr2);
+      ctx.update_value_map(&inst, expr1 | expr2);
       break;
     case Instruction::Xor:
-      ctx.update_value_map(&I, expr1 ^ expr2);
+      ctx.update_value_map(&inst, expr1 ^ expr2);
       break;
     case Instruction::FAdd:
     case Instruction::FSub:
@@ -309,17 +349,84 @@ public:
     case Instruction::FDiv:
     case Instruction::FRem:
     default:
-      throw InstructionException("Unsupported instruction", &I);
+      ERROR("Unsupported instruction", &inst);
       break;
     }
   }
 
-  void visitInstruction(Instruction &I) {
-    if (I.isBinaryOp()) {
-      visitBinaryOperator(cast<BinaryOperator>(I));
-    } else {
-      throw InstructionException("Unsupported instruction", &I);
+  void visitICmp(ICmpInst &inst) {
+    assert(inst.getNumOperands() == 2);
+    auto op1 = inst.getOperand(0);
+    auto op2 = inst.getOperand(1);
+    assert(op1->getType() == op2->getType());
+
+    auto expr1 =
+        ctx.get_z3_expr(op1, inst.getFunction(), !inst.hasNoSignedWrap());
+    auto expr2 =
+        ctx.get_z3_expr(op2, inst.getFunction(), !inst.hasNoSignedWrap());
+
+    switch (inst.getPredicate()) {
+    case CmpInst::ICMP_EQ:
+      ctx.update_value_map(&inst, expr1 == expr2);
+      break;
+    case CmpInst::ICMP_NE:
+      ctx.update_value_map(&inst, expr1 != expr2);
+      break;
+    case CmpInst::ICMP_UGT:
+      ctx.update_value_map(&inst, z3::ugt(expr1, expr2));
+      break;
+    case CmpInst::ICMP_UGE:
+      ctx.update_value_map(&inst, z3::uge(expr1, expr2));
+      break;
+    case CmpInst::ICMP_ULT:
+      ctx.update_value_map(&inst, z3::ult(expr1, expr2));
+      break;
+    case CmpInst::ICMP_ULE:
+      ctx.update_value_map(&inst, z3::ule(expr1, expr2));
+      break;
+    case CmpInst::ICMP_SGT:
+      ctx.update_value_map(&inst, z3::sgt(expr1, expr2));
+      break;
+    case CmpInst::ICMP_SGE:
+      ctx.update_value_map(&inst, z3::sge(expr1, expr2));
+      break;
+    case CmpInst::ICMP_SLT:
+      ctx.update_value_map(&inst, z3::slt(expr1, expr2));
+      break;
+    case CmpInst::ICMP_SLE:
+      ctx.update_value_map(&inst, z3::sle(expr1, expr2));
+      break;
+    case CmpInst::FCMP_FALSE:
+    case CmpInst::FCMP_OEQ:
+    case CmpInst::FCMP_OGT:
+    case CmpInst::FCMP_OGE:
+    case CmpInst::FCMP_OLT:
+    case CmpInst::FCMP_OLE:
+    case CmpInst::FCMP_ONE:
+    case CmpInst::FCMP_ORD:
+    case CmpInst::FCMP_UNO:
+    case CmpInst::FCMP_UEQ:
+    case CmpInst::FCMP_UGT:
+    case CmpInst::FCMP_UGE:
+    case CmpInst::FCMP_ULT:
+    case CmpInst::FCMP_ULE:
+    case CmpInst::FCMP_UNE:
+    case CmpInst::FCMP_TRUE:
+      ERROR("Unsupported predicate", &inst);
+      break;
+    case CmpInst::BAD_FCMP_PREDICATE:
+    case CmpInst::BAD_ICMP_PREDICATE:
+      ERROR("Bad predicate", &inst);
+      break;
     }
+  }
+
+  void visitBranchInst(BranchInst &inst) {
+    ctx.update_value_map(&inst, ctx.get_context().bool_val(true));
+  }
+
+  void visitInstruction(Instruction &inst) {
+    ERROR("Unsupported instruction", &inst);
   }
 
 private:
