@@ -23,6 +23,8 @@ public:
 
     os << msg << " at line " << line << ": ";
     if (v) {
+      v->getType()->print(os);
+      os << " ";
       v->print(os);
     } else {
       os << "Unknown instruction";
@@ -125,6 +127,8 @@ public:
             // ERROR("Unsupported type", var);
           }
         }
+        // the id of the basic block transitioning to current basic block state
+        domain.push_back(ctx.string_sort());
 
         relation_map.insert(
             {&bb, ctx.function(get_value_name(&bb, bb.getParent()).c_str(),
@@ -168,6 +172,8 @@ public:
       } else {
         ERROR("Unsupported type", v);
       }
+    } else if (v->getType()->isLabelTy()) {
+      return ctx.string_val(get_value_name(v, f));
     } else {
       ERROR("Unsupported type", v);
     }
@@ -215,6 +221,7 @@ public:
         ERROR("Unsupported type", lv);
       }
     }
+    domain.push_back(ctx.string_const("predecessor"));
     body.push_back(relation_map.at(&bb)(std::move(domain)));
 
     for (auto &inst : bb) {
@@ -261,6 +268,8 @@ public:
           ERROR("Unsupported type", var);
         }
       }
+      head_args.push_back(
+          ctx.string_const(get_value_name(&bb, bb.getParent()).c_str()));
 
       if (auto branch = dyn_cast<BranchInst>(terminatior)) {
         if (branch->isConditional()) {
@@ -279,7 +288,7 @@ public:
                       relation_map.at(succ)(std::move(head_args))));
       body.pop_back();
     }
-    bb.print(errs());
+    // bb.print(errs());
 
     return clauses;
   }
@@ -366,7 +375,6 @@ public:
       errs() << e.msg() << "\n";
       ERROR("Z3 Exception", &inst);
     }
-    errs() << ctx.get_z3_expr(&inst, inst.getFunction()).to_string() << "\n";
   }
 
   void visitICmp(ICmpInst &inst) {
@@ -498,6 +506,26 @@ public:
       ERROR("Unknown Opcode", &inst);
       break;
     }
+  }
+
+  void visitPHINode(PHINode &inst) {
+    z3::expr pred = ctx.get_context().string_const("predecessor");
+    if (inst.getNumIncomingValues() == 0) {
+      ERROR("PHINode has no incoming values", &inst);
+    }
+
+    z3::expr e = z3::ite(
+        pred == ctx.get_z3_expr(inst.getIncomingBlock(0), inst.getFunction()),
+        ctx.get_z3_expr(inst.getIncomingValue(0), inst.getFunction()), e);
+    for (unsigned int i = 1; i < inst.getNumIncomingValues(); ++i) {
+      auto incoming_expr =
+          ctx.get_z3_expr(inst.getIncomingValue(i), inst.getFunction());
+      e = z3::ite(
+          pred == ctx.get_z3_expr(inst.getIncomingBlock(i), inst.getFunction()),
+          std::move(incoming_expr), std::move(e));
+    }
+
+    ctx.update_value_map(&inst, std::move(e));
   }
 
   void visitInstruction(Instruction &inst) {
