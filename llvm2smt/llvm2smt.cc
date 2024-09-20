@@ -98,7 +98,11 @@ private:
 class Context {
 public:
   Context(Module *m)
-      : fp(z3::fixedpoint(ctx)), slot_tracker(ModuleSlotTracker(m)) {
+      : fp(z3::fixedpoint(ctx)), byte_sort(ctx.bv_sort(8)),
+        address_sort(ctx.bv_sort(64)),
+        memory_sort(ctx.array_sort(address_sort, byte_sort)),
+        slot_tracker(ModuleSlotTracker(m)), memory_state_num(0) {
+
     for (auto &f : *m) {
       if (f.isDeclaration()) {
         continue;
@@ -123,12 +127,18 @@ public:
               domain.push_back(
                   ctx.bv_sort(var->getType()->getIntegerBitWidth()));
             }
+          } else if (var->getType()->isIntOrPtrTy()) {
+            domain.push_back(ctx.bv_sort(64));
           } else {
-            // ERROR("Unsupported type", var);
+            ERROR("Unsupported type", var);
           }
         }
         // the id of the basic block transitioning to current basic block state
         domain.push_back(ctx.string_sort());
+        // current memory state
+        domain.push_back(memory_sort);
+        // stack pointer
+        domain.push_back(address_sort);
 
         relation_map.insert(
             {&bb, ctx.function(get_value_name(&bb, bb.getParent()).c_str(),
@@ -138,24 +148,36 @@ public:
     }
   }
 
-  z3::expr get_z3_expr(Value *v, Function *f, bool is_signed = true) {
-    auto it = value_map.find(v);
-    if (it != value_map.end()) {
-      return it->second;
-    }
+  z3::expr to_z3_expr(Value *v, Function *f, bool is_signed = true) {
     if (isa<Constant>(v)) {
       if (auto constant_int = dyn_cast<ConstantInt>(v)) {
         auto width = constant_int->getType()->getIntegerBitWidth();
         if (width == 1) {
-          value_map.insert(
-              {v, ctx.bool_val(constant_int->getZExtValue() != 0)});
+          return ctx.bool_val(is_signed ? constant_int->getSExtValue() != 0
+                                        : constant_int->getZExtValue() != 0);
         } else {
-          value_map.insert(
-              {v, ctx.bv_val(is_signed ? constant_int->getSExtValue()
-                                       : constant_int->getZExtValue(),
-                             width)});
+          return ctx.bv_val(is_signed ? constant_int->getSExtValue()
+                                      : constant_int->getZExtValue(),
+                            width);
         }
-        return value_map.at(v);
+      } else if (auto global_variable = dyn_cast<GlobalVariable>(v)) {
+        if (global_variable->isExternalLinkage(global_variable->getLinkage())) {
+          if (global_variable->getValueType()->isIntegerTy()) {
+            auto width = global_variable->getValueType()->getIntegerBitWidth();
+            if (width == 1) {
+              return ctx.bool_const(get_value_name(global_variable, f).c_str());
+            } else {
+              return ctx.bv_const(get_value_name(global_variable, f).c_str(),
+                                  width);
+            }
+          } else if (global_variable->getValueType()->isPointerTy()) {
+            return ctx.bv_const(get_value_name(global_variable, f).c_str(), 64);
+          } else {
+            ERROR("Unsupported type", v);
+          }
+        } else {
+          ERROR("Unsupported type", v);
+        }
       } else {
         ERROR("Unsupported type", v);
       }
@@ -163,12 +185,10 @@ public:
       if (v->getType()->isIntegerTy()) {
         auto width = v->getType()->getIntegerBitWidth();
         if (width == 1) {
-          value_map.insert({v, ctx.bool_const(get_value_name(v, f).c_str())});
+          return ctx.bool_const(get_value_name(v, f).c_str());
         } else {
-          value_map.insert(
-              {v, ctx.bv_const(get_value_name(v, f).c_str(), width)});
+          return ctx.bv_const(get_value_name(v, f).c_str(), width);
         }
-        return value_map.at(v);
       } else {
         ERROR("Unsupported type", v);
       }
@@ -178,6 +198,8 @@ public:
       ERROR("Unsupported type", v);
     }
   }
+
+  z3::expr query_value_map(Value *v) { return value_map.at(v); }
 
   void update_value_map(Value *v, z3::expr &&e) {
     value_map.insert({v, std::move(e)});
@@ -217,19 +239,27 @@ public:
           domain.push_back(
               ctx.bv_const(get_value_name(lv, bb.getParent()).c_str(), width));
         }
+      } else if (lv->getType()->isIntOrPtrTy()) {
+        domain.push_back(
+            ctx.bv_const(get_value_name(lv, bb.getParent()).c_str(), 64));
       } else {
         ERROR("Unsupported type", lv);
       }
     }
     domain.push_back(ctx.string_const("predecessor"));
+    domain.push_back(ctx.constant("memory_0", memory_sort));
+    domain.push_back(ctx.constant("sp_0", address_sort));
     body.push_back(relation_map.at(&bb)(std::move(domain)));
 
+    int memory_state_num = 0;
     for (auto &inst : bb) {
       try {
         if (has_value(&inst)) {
           auto type = inst.getType();
-          if (type->isIntegerTy()) {
-            auto rhs = get_z3_expr(&inst, bb.getParent());
+          if (isa<AllocaInst>(inst)) {
+            body.push_back(query_value_map(&inst));
+          } else if (type->isIntegerTy()) {
+            auto rhs = query_value_map(&inst);
             auto width = type->getIntegerBitWidth();
             auto lhs =
                 width == 1
@@ -264,17 +294,24 @@ public:
             head_args.push_back(ctx.bv_const(
                 get_value_name(var, bb.getParent()).c_str(), width));
           }
+        } else if (var->getType()->isIntOrPtrTy()) {
+          head_args.push_back(
+              ctx.bv_const(get_value_name(var, bb.getParent()).c_str(), 64));
         } else {
           ERROR("Unsupported type", var);
         }
       }
       head_args.push_back(
           ctx.string_const(get_value_name(&bb, bb.getParent()).c_str()));
+      head_args.push_back(ctx.constant(
+          ("memory_" + std::to_string(memory_state_num)).c_str(), memory_sort));
+      head_args.push_back(ctx.constant(
+          ("sp_" + std::to_string(memory_state_num)).c_str(), address_sort));
 
       if (auto branch = dyn_cast<BranchInst>(terminatior)) {
         if (branch->isConditional()) {
           auto cond = branch->getCondition();
-          auto expr = get_z3_expr(cond, bb.getParent());
+          auto expr = to_z3_expr(cond, bb.getParent());
           if (branch->getSuccessor(0) == succ) {
             body.push_back(expr);
           } else {
@@ -293,13 +330,27 @@ public:
     return clauses;
   }
 
+  void reset_memory_state() noexcept { memory_state_num = 0; }
+
+  z3::sort get_byte_sort() const noexcept { return byte_sort; }
+  z3::sort get_address_sort() const noexcept { return address_sort; }
+  z3::sort get_memory_sort() const noexcept { return memory_sort; }
+  int get_memory_state_num() const noexcept { return memory_state_num; }
+  void inc_memory_state_num() noexcept { ++memory_state_num; }
+
 private:
   z3::context ctx{};
   z3::fixedpoint fp;
+  z3::sort byte_sort;
+  z3::sort address_sort;
+  z3::sort memory_sort;
+
   std::map<Value *, z3::expr> value_map{};
   ModuleSlotTracker slot_tracker;
   std::map<BasicBlock *, z3::func_decl> relation_map{};
   std::map<Function *, LiveVariableAnalysis> live_vars_map{};
+  int memory_state_num{};
+  int call_num{};
 };
 
 class llvm2smtVisitor : public InstVisitor<llvm2smtVisitor> {
@@ -313,9 +364,9 @@ public:
     assert(op1->getType() == op2->getType());
 
     auto expr1 =
-        ctx.get_z3_expr(op1, inst.getFunction(), !inst.hasNoSignedWrap());
+        ctx.to_z3_expr(op1, inst.getFunction(), !inst.hasNoSignedWrap());
     auto expr2 =
-        ctx.get_z3_expr(op2, inst.getFunction(), !inst.hasNoSignedWrap());
+        ctx.to_z3_expr(op2, inst.getFunction(), !inst.hasNoSignedWrap());
 
     try {
       switch (inst.getOpcode()) {
@@ -384,9 +435,9 @@ public:
     assert(op1->getType() == op2->getType());
 
     auto expr1 =
-        ctx.get_z3_expr(op1, inst.getFunction(), !inst.hasNoSignedWrap());
+        ctx.to_z3_expr(op1, inst.getFunction(), !inst.hasNoSignedWrap());
     auto expr2 =
-        ctx.get_z3_expr(op2, inst.getFunction(), !inst.hasNoSignedWrap());
+        ctx.to_z3_expr(op2, inst.getFunction(), !inst.hasNoSignedWrap());
 
     try {
       switch (inst.getPredicate()) {
@@ -459,7 +510,7 @@ public:
     if (v == nullptr) {
       ERROR("Operand is null", &inst);
     }
-    auto e = ctx.get_z3_expr(v, inst.getFunction(), !inst.hasNoSignedWrap());
+    auto e = ctx.to_z3_expr(v, inst.getFunction(), !inst.hasNoSignedWrap());
 
     switch (inst.getOpcode()) {
     case Instruction::ZExt:
@@ -514,18 +565,122 @@ public:
       ERROR("PHINode has no incoming values", &inst);
     }
 
-    z3::expr e = z3::ite(
-        pred == ctx.get_z3_expr(inst.getIncomingBlock(0), inst.getFunction()),
-        ctx.get_z3_expr(inst.getIncomingValue(0), inst.getFunction()), e);
-    for (unsigned int i = 1; i < inst.getNumIncomingValues(); ++i) {
-      auto incoming_expr =
-          ctx.get_z3_expr(inst.getIncomingValue(i), inst.getFunction());
-      e = z3::ite(
-          pred == ctx.get_z3_expr(inst.getIncomingBlock(i), inst.getFunction()),
-          std::move(incoming_expr), std::move(e));
-    }
+    // z3::expr e = z3::ite(
+    //     pred == ctx.get_z3_expr(inst.getIncomingBlock(0),
+    //     inst.getFunction()), ctx.get_z3_expr(inst.getIncomingValue(0),
+    //     inst.getFunction()), e);
+    // for (unsigned int i = 1; i < inst.getNumIncomingValues(); ++i) {
+    //   auto incoming_expr =
+    //       ctx.get_z3_expr(inst.getIncomingValue(i), inst.getFunction());
+    //   e = z3::ite(
+    //       pred == ctx.get_z3_expr(inst.getIncomingBlock(i),
+    //       inst.getFunction()), std::move(incoming_expr), std::move(e));
+    // }
 
-    ctx.update_value_map(&inst, std::move(e));
+    // ctx.update_value_map(&inst, std::move(e));
+  }
+
+  void visitReturnInst(ReturnInst &inst) {}
+
+  void visitAllocaInst(AllocaInst &inst) {
+    auto name = ctx.get_value_name(&inst, inst.getFunction());
+    auto memory = ctx.get_context().constant(
+        ("memory_" + std::to_string(ctx.get_memory_state_num())).c_str(),
+        ctx.get_memory_sort());
+    auto new_memory = ctx.get_context().constant(
+        ("memory_" + std::to_string(ctx.get_memory_state_num() + 1)).c_str(),
+        ctx.get_memory_sort());
+    auto sp = ctx.get_context().constant(
+        ("sp_" + std::to_string(ctx.get_memory_state_num())).c_str(),
+        ctx.get_address_sort());
+    auto new_sp = ctx.get_context().constant(
+        ("sp_" + std::to_string(ctx.get_memory_state_num() + 1)).c_str(),
+        ctx.get_memory_sort());
+
+    z3::expr_vector states(ctx.get_context());
+    states.push_back(new_memory = memory);
+    if (inst.getAllocatedType()->isIntegerTy()) {
+      states.push_back(
+          new_sp =
+              sp -
+              ctx.get_context().bv_val(
+                  (inst.getAllocatedType()->getIntegerBitWidth() + 7) / 8, 64));
+    } else {
+      ERROR("Unsupported type", &inst);
+    }
+    states.push_back(ctx.get_context().bv_const(
+                         ctx.get_value_name(&inst, inst.getFunction()).c_str(),
+                         64) = new_sp);
+
+    ctx.update_value_map(&inst, z3::mk_and(states));
+    ctx.inc_memory_state_num();
+  }
+
+  void visitLoadInst(LoadInst &inst) {
+    auto ptr = inst.getPointerOperand();
+    auto ptr_expr = ctx.to_z3_expr(ptr, inst.getFunction());
+    auto memory = ctx.get_context().constant(
+        ("memory_" + std::to_string(ctx.get_memory_state_num())).c_str(),
+        ctx.get_memory_sort());
+    auto sp = ctx.get_context().constant(
+        ("sp_" + std::to_string(ctx.get_memory_state_num())).c_str(),
+        ctx.get_address_sort());
+
+    if (inst.getType()->isIntegerTy()) {
+      auto width = inst.getType()->getIntegerBitWidth();
+      z3::expr_vector bytes(ctx.get_context());
+
+      // little endian
+      for (unsigned int i = (width - 1) / 8; i >= 0; --i) {
+        auto byte = z3::select(memory, sp + ctx.get_context().bv_val(i, 64));
+        bytes.push_back(std::move(byte));
+      }
+
+      ctx.update_value_map(&inst, z3::concat(bytes).extract(width - 1, 0));
+    } else {
+      ERROR("Unsupported type", &inst);
+    }
+  }
+
+  void visitStoreInst(StoreInst &inst) {
+    auto ptr = inst.getPointerOperand();
+    auto val = inst.getValueOperand();
+
+    auto ptr_expr = ctx.to_z3_expr(ptr, inst.getFunction());
+    auto val_expr = ctx.to_z3_expr(val, inst.getFunction());
+
+    auto memory = ctx.get_context().constant(
+        ("memory_" + std::to_string(ctx.get_memory_state_num())).c_str(),
+        ctx.get_memory_sort());
+    auto sp = ctx.get_context().constant(
+        ("sp_" + std::to_string(ctx.get_memory_state_num())).c_str(),
+        ctx.get_address_sort());
+
+    auto byte_sort = ctx.get_byte_sort();
+    auto address_sort = ctx.get_address_sort();
+    auto memory_sort = ctx.get_memory_sort();
+
+    if (val->getType()->isIntegerTy()) {
+      auto width = val->getType()->getIntegerBitWidth();
+      z3::expr_vector new_memory(ctx.get_context());
+
+      // little endian
+      for (unsigned int i = 0; i < (width + 7) / 8; ++i) {
+        auto byte = val_expr.extract(i * 8 + 7, i * 8);
+        ctx.inc_memory_state_num();
+        new_memory.push_back(
+            ctx.get_context().constant(
+                ("memory_" + std::to_string(ctx.get_memory_state_num()))
+                    .c_str(),
+                ctx.get_memory_sort()) =
+                z3::store(memory, ptr_expr + ctx.get_context().bv_val(i, 64),
+                          std::move(byte)));
+      }
+
+      ctx.update_value_map(&inst, z3::mk_and(new_memory));
+    } else {
+      ERROR("Unsupported type", &inst);
+    }
   }
 
   void visitInstruction(Instruction &inst) {
@@ -551,13 +706,15 @@ public:
 
       llvm2smtVisitor visitor(ctx);
 
-      try {
-        visitor.visit(f);
-      } catch (InstructionException &e) {
-        errs() << e.what();
-      }
-
       for (auto &bb : f) {
+        ctx.reset_memory_state();
+
+        try {
+          visitor.visit(bb);
+        } catch (InstructionException &e) {
+          errs() << e.what();
+        }
+
         auto clauses = ctx.get_horn_clause(bb);
         errs() << clauses.to_string() << "\n";
       }
