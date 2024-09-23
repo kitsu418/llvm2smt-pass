@@ -333,6 +333,8 @@ public:
           } else {
             body.push_back(!expr);
           }
+        } else {
+          body.push_back(ctx.bool_val(true));
         }
       }
 
