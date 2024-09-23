@@ -127,14 +127,29 @@ public:
               domain.push_back(
                   ctx.bv_sort(var->getType()->getIntegerBitWidth()));
             }
-          } else if (var->getType()->isIntOrPtrTy()) {
+          } else if (var->getType()->isPointerTy()) {
             domain.push_back(ctx.bv_sort(64));
           } else {
             ERROR("Unsupported type", var);
           }
         }
-        // the id of the basic block transitioning to current basic block state
-        domain.push_back(ctx.string_sort());
+
+        // work with PHI nodes: we extract them to the arguments of the head
+        for (auto &phi : bb.phis()) {
+          if (phi.getType()->isIntegerTy()) {
+            if (phi.getType()->getIntegerBitWidth() == 1) {
+              domain.push_back(ctx.bool_sort());
+            } else {
+              domain.push_back(
+                  ctx.bv_sort(phi.getType()->getIntegerBitWidth()));
+            }
+          } else if (phi.getType()->isPointerTy()) {
+            domain.push_back(ctx.bv_sort(64));
+          } else {
+            ERROR("Unsupported type", &phi);
+          }
+        }
+
         // current memory state
         domain.push_back(memory_sort);
         // stack pointer
@@ -263,14 +278,34 @@ public:
         ERROR("Unsupported type", lv);
       }
     }
-    domain.push_back(ctx.string_const("predecessor"));
+
+    for (auto &phi : bb.phis()) {
+      if (phi.getType()->isIntegerTy()) {
+        auto width = phi.getType()->getIntegerBitWidth();
+        if (width == 1) {
+          domain.push_back(
+              ctx.bool_const(get_value_name(&phi, bb.getParent()).c_str()));
+        } else {
+          domain.push_back(ctx.bv_const(
+              get_value_name(&phi, bb.getParent()).c_str(), width));
+        }
+      } else if (phi.getType()->isPointerTy()) {
+        domain.push_back(
+            ctx.bv_const(get_value_name(&phi, bb.getParent()).c_str(), 64));
+      } else {
+        ERROR("Unsupported type", &phi);
+      }
+    }
+
     domain.push_back(ctx.constant("memory_0", memory_sort));
     domain.push_back(ctx.constant("sp_0", address_sort));
     body.push_back(relation_map.at(&bb)(std::move(domain)));
 
     for (auto &inst : bb) {
       try {
-        if (has_value(&inst)) {
+        if (isa<PHINode>(inst)) {
+          continue;
+        } else if (has_value(&inst)) {
           auto type = inst.getType();
           if (isa<AllocaInst>(inst) || isa<StoreInst>(inst)) {
             body.push_back(query_value_map(&inst));
@@ -317,8 +352,12 @@ public:
           ERROR("Unsupported type", var);
         }
       }
-      head_args.push_back(
-          ctx.string_const(get_value_name(&bb, bb.getParent()).c_str()));
+
+      for (auto &phi : succ->phis()) {
+        auto incoming = phi.getIncomingValueForBlock(&bb);
+        head_args.push_back(to_z3_expr(incoming, bb.getParent()));
+      }
+
       head_args.push_back(ctx.constant(
           ("memory_" + std::to_string(memory_state_num)).c_str(), memory_sort));
       head_args.push_back(ctx.constant(
@@ -582,24 +621,7 @@ public:
   }
 
   void visitPHINode(PHINode &inst) {
-    z3::expr pred = ctx.get_context().string_const("predecessor");
-    if (inst.getNumIncomingValues() == 0) {
-      ERROR("PHINode has no incoming values", &inst);
-    }
-
-    // z3::expr e = z3::ite(
-    //     pred == ctx.get_z3_expr(inst.getIncomingBlock(0),
-    //     inst.getFunction()), ctx.get_z3_expr(inst.getIncomingValue(0),
-    //     inst.getFunction()), e);
-    // for (unsigned int i = 1; i < inst.getNumIncomingValues(); ++i) {
-    //   auto incoming_expr =
-    //       ctx.get_z3_expr(inst.getIncomingValue(i), inst.getFunction());
-    //   e = z3::ite(
-    //       pred == ctx.get_z3_expr(inst.getIncomingBlock(i),
-    //       inst.getFunction()), std::move(incoming_expr), std::move(e));
-    // }
-
-    // ctx.update_value_map(&inst, std::move(e));
+    // we work with PHI nodes in the add_rules method
   }
 
   void visitReturnInst(ReturnInst &inst) {}
