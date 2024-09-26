@@ -704,9 +704,10 @@ public:
       if (!dst->isFloatTy() && !dst->isDoubleTy()) {
         ERROR("Invalid cast", &inst);
       }
-      ctx.update_value_map(&inst, z3::sbv_to_fpa (e, dst->isFloatTy()
-                                                  ? ctx.get_context().fpa_sort<32>()
-                                                  : ctx.get_context().fpa_sort<64>()));
+      ctx.update_value_map(
+          &inst, z3::sbv_to_fpa(e, dst->isFloatTy()
+                                       ? ctx.get_context().fpa_sort<32>()
+                                       : ctx.get_context().fpa_sort<64>()));
       break;
     case Instruction::BitCast:
     case Instruction::FPToUI:
@@ -904,6 +905,47 @@ public:
     default:
       ERROR("Unsupported instruction", &inst);
       break;
+    }
+  }
+
+  void visitIntrinsicInst(IntrinsicInst &inst) {
+    // just ignore them
+  }
+
+  void visitGetElementPtrInst(GetElementPtrInst &inst) {
+    auto base = inst.getPointerOperand();
+    auto index = inst.getOperand(1);
+
+    if (!index->getType()->isIntegerTy()) {
+      ERROR("Index is not Integer", &inst);
+    }
+
+    if (index->getType()->getIntegerBitWidth() != 64) {
+      ERROR("Index width is not 64", &inst);
+    }
+
+    auto base_expr = ctx.to_z3_expr(base, inst.getFunction());
+    auto type = inst.getType();
+
+    if (type->isIntegerTy()) {
+      auto size = (type->getIntegerBitWidth() + 7) / 8;
+      ctx.update_value_map(
+          &inst,
+          base_expr + z3::shl(ctx.to_z3_expr(index, inst.getFunction()), size));
+    } else if (type->isFloatTy()) {
+      ctx.update_value_map(
+          &inst,
+          base_expr + z3::shl(ctx.to_z3_expr(index, inst.getFunction()), 2));
+    } else if (type->isDoubleTy()) {
+      ctx.update_value_map(
+          &inst,
+          base_expr + z3::shl(ctx.to_z3_expr(index, inst.getFunction()), 4));
+    } else if (type->isPointerTy()) {
+      ctx.update_value_map(
+          &inst,
+          base_expr + z3::shl(ctx.to_z3_expr(index, inst.getFunction()), 4));
+    } else {
+      ERROR("Unsupported type", &inst);
     }
   }
 
