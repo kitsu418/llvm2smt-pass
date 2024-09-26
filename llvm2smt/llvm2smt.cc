@@ -129,6 +129,10 @@ public:
             }
           } else if (var->getType()->isPointerTy()) {
             domain.push_back(ctx.bv_sort(64));
+          } else if (var->getType()->isFloatTy()) {
+            domain.push_back(ctx.fpa_sort<32>());
+          } else if (var->getType()->isDoubleTy()) {
+            domain.push_back(ctx.fpa_sort<64>());
           } else {
             ERROR("Unsupported type", var);
           }
@@ -145,6 +149,10 @@ public:
             }
           } else if (phi.getType()->isPointerTy()) {
             domain.push_back(ctx.bv_sort(64));
+          } else if (phi.getType()->isFloatTy()) {
+            domain.push_back(ctx.fpa_sort<32>());
+          } else if (phi.getType()->isDoubleTy()) {
+            domain.push_back(ctx.fpa_sort<64>());
           } else {
             ERROR("Unsupported type", &phi);
           }
@@ -194,6 +202,16 @@ public:
         } else {
           ERROR("Unsupported type", v);
         }
+      } else if (isa<ConstantFP>(v)) {
+        if (v->getType()->isFloatTy()) {
+          return ctx.fpa_val(
+              cast<ConstantFP>(v)->getValueAPF().convertToFloat());
+        } else if (v->getType()->isDoubleTy()) {
+          return ctx.fpa_val(
+              cast<ConstantFP>(v)->getValueAPF().convertToDouble());
+        } else {
+          ERROR("Unsupported type", v);
+        }
       } else {
         ERROR("Unsupported type", v);
       }
@@ -207,6 +225,10 @@ public:
         }
       } else if (v->getType()->isPointerTy()) {
         return ctx.constant(get_value_name(v, f).c_str(), address_sort);
+      } else if (v->getType()->isFloatTy()) {
+        return ctx.fpa_const<32>(get_value_name(v, f).c_str());
+      } else if (v->getType()->isDoubleTy()) {
+        return ctx.fpa_const<64>(get_value_name(v, f).c_str());
       } else {
         ERROR("Unsupported type", v);
       }
@@ -224,6 +246,10 @@ public:
         }
       } else if (v->getType()->isPointerTy()) {
         return ctx.bv_const(name.c_str(), 64);
+      } else if (v->getType()->isFloatTy()) {
+        return ctx.fpa_const<32>(name.c_str());
+      } else if (v->getType()->isDoubleTy()) {
+        return ctx.fpa_const<64>(name.c_str());
       } else {
         ERROR("Unsupported type", v);
       }
@@ -262,39 +288,11 @@ public:
 
     z3::expr_vector domain(ctx);
     for (auto lv : lva.get_in(&bb)) {
-      if (lv->getType()->isIntegerTy()) {
-        auto width = lv->getType()->getIntegerBitWidth();
-        if (width == 1) {
-          domain.push_back(
-              ctx.bool_const(get_value_name(lv, bb.getParent()).c_str()));
-        } else {
-          domain.push_back(
-              ctx.bv_const(get_value_name(lv, bb.getParent()).c_str(), width));
-        }
-      } else if (lv->getType()->isIntOrPtrTy()) {
-        domain.push_back(
-            ctx.bv_const(get_value_name(lv, bb.getParent()).c_str(), 64));
-      } else {
-        ERROR("Unsupported type", lv);
-      }
+      domain.push_back(to_z3_expr(lv, bb.getParent()));
     }
 
     for (auto &phi : bb.phis()) {
-      if (phi.getType()->isIntegerTy()) {
-        auto width = phi.getType()->getIntegerBitWidth();
-        if (width == 1) {
-          domain.push_back(
-              ctx.bool_const(get_value_name(&phi, bb.getParent()).c_str()));
-        } else {
-          domain.push_back(ctx.bv_const(
-              get_value_name(&phi, bb.getParent()).c_str(), width));
-        }
-      } else if (phi.getType()->isPointerTy()) {
-        domain.push_back(
-            ctx.bv_const(get_value_name(&phi, bb.getParent()).c_str(), 64));
-      } else {
-        ERROR("Unsupported type", &phi);
-      }
+      domain.push_back(to_z3_expr(&phi, bb.getParent()));
     }
 
     domain.push_back(ctx.constant("memory_0", memory_sort));
@@ -321,6 +319,21 @@ public:
             body.push_back(lhs == rhs);
           } else if (type->isVoidTy()) {
             continue;
+          } else if (type->isPointerTy()) {
+            auto rhs = query_value_map(&inst);
+            auto lhs =
+                ctx.bv_const(get_value_name(&inst, bb.getParent()).c_str(), 64);
+            body.push_back(lhs == rhs);
+          } else if (type->isFloatTy()) {
+            auto rhs = query_value_map(&inst);
+            auto lhs = ctx.fpa_const<32>(
+                get_value_name(&inst, bb.getParent()).c_str());
+            body.push_back(lhs == rhs);
+          } else if (type->isDoubleTy()) {
+            auto rhs = query_value_map(&inst);
+            auto lhs = ctx.fpa_const<64>(
+                get_value_name(&inst, bb.getParent()).c_str());
+            body.push_back(lhs == rhs);
           } else {
             ERROR("Unsupported type", &inst);
           }
@@ -336,21 +349,7 @@ public:
     for (auto succ : successors(&bb)) {
       z3::expr_vector head_args(ctx);
       for (auto var : lva.get_in(succ)) {
-        if (var->getType()->isIntegerTy()) {
-          auto width = var->getType()->getIntegerBitWidth();
-          if (width == 1) {
-            head_args.push_back(
-                ctx.bool_const(get_value_name(var, bb.getParent()).c_str()));
-          } else {
-            head_args.push_back(ctx.bv_const(
-                get_value_name(var, bb.getParent()).c_str(), width));
-          }
-        } else if (var->getType()->isIntOrPtrTy()) {
-          head_args.push_back(
-              ctx.bv_const(get_value_name(var, bb.getParent()).c_str(), 64));
-        } else {
-          ERROR("Unsupported type", var);
-        }
+        head_args.push_back(to_z3_expr(var, bb.getParent()));
       }
 
       for (auto &phi : succ->phis()) {
@@ -432,9 +431,11 @@ public:
     try {
       switch (inst.getOpcode()) {
       case Instruction::Add:
+      case Instruction::FAdd:
         ctx.update_value_map(&inst, expr1 + expr2);
         break;
       case Instruction::Sub:
+      case Instruction::FSub:
         ctx.update_value_map(&inst, expr1 - expr2);
         break;
       case Instruction::Mul:
@@ -472,12 +473,14 @@ public:
       case Instruction::Xor:
         ctx.update_value_map(&inst, expr1 ^ expr2);
         break;
-      case Instruction::FAdd:
-      case Instruction::FSub:
       case Instruction::FMul:
+        ctx.update_value_map(&inst, expr1 * expr2);
+        break;
       case Instruction::FDiv:
+        ctx.update_value_map(&inst, expr1 / expr2);
+        break;
       case Instruction::FRem:
-        ERROR("Unsupported instruction", &inst);
+        ctx.update_value_map(&inst, z3::rem(expr1, expr2));
         break;
       default:
         ERROR("Unknown instruction", &inst);
@@ -560,6 +563,98 @@ public:
     }
   }
 
+  void visitFCmp(FCmpInst &inst) {
+    assert(inst.getNumOperands() == 2);
+    auto op1 = inst.getOperand(0);
+    auto op2 = inst.getOperand(1);
+    assert(op1->getType() == op2->getType());
+
+    if (!op1->getType()->isFloatTy() && !op1->getType()->isDoubleTy()) {
+      ERROR("Unsupported type", &inst);
+    }
+
+    auto expr1 = ctx.to_z3_expr(op1, inst.getFunction());
+    auto expr2 = ctx.to_z3_expr(op2, inst.getFunction());
+
+    switch (inst.getPredicate()) {
+    case CmpInst::FCMP_FALSE:
+      ctx.update_value_map(&inst, ctx.get_context().bool_val(false));
+      break;
+    case CmpInst::FCMP_OEQ:
+      ctx.update_value_map(&inst, z3::fp_eq(expr1, expr2) &&
+                                      !expr1.mk_is_nan() && !expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_OGT:
+      ctx.update_value_map(&inst, expr1 > expr2 && !expr1.mk_is_nan() &&
+                                      !expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_OGE:
+      ctx.update_value_map(&inst, expr1 >= expr2 && !expr1.mk_is_nan() &&
+                                      !expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_OLT:
+      ctx.update_value_map(&inst, expr1 < expr2 && !expr1.mk_is_nan() &&
+                                      !expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_OLE:
+      ctx.update_value_map(&inst, expr1 <= expr2 && !expr1.mk_is_nan() &&
+                                      !expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_ONE:
+      ctx.update_value_map(&inst, !z3::fp_eq(expr1, expr2) &&
+                                      !expr1.mk_is_nan() && !expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_ORD:
+      ctx.update_value_map(&inst, !expr1.mk_is_nan() && !expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_UNO:
+      ctx.update_value_map(&inst, expr1.mk_is_nan() || expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_UEQ:
+      ctx.update_value_map(&inst, z3::fp_eq(expr1, expr2) ||
+                                      expr1.mk_is_nan() || expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_UGT:
+      ctx.update_value_map(&inst, expr1 > expr2 || expr1.mk_is_nan() ||
+                                      expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_UGE:
+      ctx.update_value_map(&inst, expr1 >= expr2 || expr1.mk_is_nan() ||
+                                      expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_ULT:
+      ctx.update_value_map(&inst, expr1 < expr2 || expr1.mk_is_nan() ||
+                                      expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_ULE:
+      ctx.update_value_map(&inst, expr1 <= expr2 || expr1.mk_is_nan() ||
+                                      expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_UNE:
+      ctx.update_value_map(&inst, !z3::fp_eq(expr1, expr2) ||
+                                      expr1.mk_is_nan() || expr2.mk_is_nan());
+      break;
+    case CmpInst::FCMP_TRUE:
+      ctx.update_value_map(&inst, ctx.get_context().bool_val(true));
+      break;
+    case CmpInst::ICMP_EQ:
+    case CmpInst::ICMP_NE:
+    case CmpInst::ICMP_UGT:
+    case CmpInst::ICMP_UGE:
+    case CmpInst::ICMP_ULT:
+    case CmpInst::ICMP_ULE:
+    case CmpInst::ICMP_SGT:
+    case CmpInst::ICMP_SGE:
+    case CmpInst::ICMP_SLT:
+    case CmpInst::ICMP_SLE:
+      ERROR("Unsupported predicate", &inst);
+      break;
+    default:
+      ERROR("Unknown predicate", &inst);
+      break;
+    }
+  }
+
   void visitBranchInst(BranchInst &inst) {
     // do nothing here
   }
@@ -602,11 +697,21 @@ public:
       }
       ctx.update_value_map(&inst, e.extract(dst->getIntegerBitWidth() - 1, 0));
       break;
+    case Instruction::SIToFP:
+      if (!v->getType()->isIntegerTy()) {
+        ERROR("Value is not Integer", v);
+      }
+      if (!dst->isFloatTy() && !dst->isDoubleTy()) {
+        ERROR("Invalid cast", &inst);
+      }
+      ctx.update_value_map(&inst, z3::sbv_to_fpa (e, dst->isFloatTy()
+                                                  ? ctx.get_context().fpa_sort<32>()
+                                                  : ctx.get_context().fpa_sort<64>()));
+      break;
     case Instruction::BitCast:
     case Instruction::FPToUI:
     case Instruction::FPToSI:
     case Instruction::UIToFP:
-    case Instruction::SIToFP:
     case Instruction::FPTrunc:
     case Instruction::FPExt:
     case Instruction::PtrToInt:
@@ -649,6 +754,11 @@ public:
           sp -
               ctx.get_context().bv_val(
                   (inst.getAllocatedType()->getIntegerBitWidth() + 7) / 8, 64));
+    } else if (inst.getAllocatedType()->isFloatTy()) {
+      states.push_back(new_sp == sp - ctx.get_context().bv_val(4, 64));
+    } else if (inst.getAllocatedType()->isDoubleTy() ||
+               inst.getAllocatedType()->isPointerTy()) {
+      states.push_back(new_sp == sp - ctx.get_context().bv_val(8, 64));
     } else {
       ERROR("Unsupported type", &inst);
     }
@@ -674,13 +784,34 @@ public:
 
       // little endian
       for (int i = (width - 1) / 8; i >= 0; --i) {
-        auto byte = z3::select(memory, sp + ctx.get_context().bv_val(i, 64));
+        auto byte =
+            z3::select(memory, ptr_expr + ctx.get_context().bv_val(i, 64));
         bytes.push_back(std::move(byte));
       }
 
       ctx.update_value_map(
           &inst, width % 8 == 0 ? z3::concat(bytes)
                                 : z3::concat(bytes).extract(width - 1, 0));
+    } else if (inst.getType()->isPointerTy()) {
+      z3::expr_vector bytes(ctx.get_context());
+      for (int i = 7; i >= 0; --i) {
+        auto byte =
+            z3::select(memory, ptr_expr + ctx.get_context().bv_val(i, 64));
+        bytes.push_back(std::move(byte));
+      }
+      ctx.update_value_map(&inst, z3::concat(bytes));
+    } else if (inst.getType()->isFloatTy() || inst.getType()->isDoubleTy()) {
+      z3::expr_vector bytes(ctx.get_context());
+      for (int i = inst.getType()->isFloatTy() ? 3 : 7; i >= 0; --i) {
+        auto byte =
+            z3::select(memory, ptr_expr + ctx.get_context().bv_val(i, 64));
+        bytes.push_back(std::move(byte));
+      }
+      ctx.update_value_map(
+          &inst, z3::sbv_to_fpa(z3::concat(bytes),
+                                inst.getType()->isFloatTy()
+                                    ? ctx.get_context().fpa_sort<32>()
+                                    : ctx.get_context().fpa_sort<64>()));
     } else {
       ERROR("Unsupported type", &inst);
     }
@@ -700,8 +831,10 @@ public:
         ("sp_" + std::to_string(ctx.get_memory_state_num())).c_str(),
         ctx.get_address_sort());
 
-    if (val->getType()->isIntegerTy()) {
-      auto width = val->getType()->getIntegerBitWidth();
+    if (val->getType()->isIntegerTy() || val->getType()->isPointerTy()) {
+      auto width = val->getType()->isIntegerTy()
+                       ? val->getType()->getIntegerBitWidth()
+                       : 64;
       z3::expr_vector new_memory(ctx.get_context());
 
       // little endian
@@ -717,6 +850,20 @@ public:
                       std::move(byte)));
       }
 
+      ctx.update_value_map(&inst, z3::mk_and(new_memory));
+    } else if (val->getType()->isFloatTy() || val->getType()->isDoubleTy()) {
+      z3::expr_vector new_memory(ctx.get_context());
+      auto bv = val_expr.mk_to_ieee_bv();
+      for (unsigned int i = 0; i < (val->getType()->isFloatTy() ? 4 : 8); ++i) {
+        ctx.inc_memory_state_num();
+        new_memory.push_back(
+            ctx.get_context().constant(
+                ("memory_" + std::to_string(ctx.get_memory_state_num()))
+                    .c_str(),
+                ctx.get_memory_sort()) ==
+            z3::store(memory, ptr_expr + ctx.get_context().bv_val(i, 64),
+                      bv.extract(i * 8 + 7, i * 8)));
+      }
       ctx.update_value_map(&inst, z3::mk_and(new_memory));
     } else {
       ERROR("Unsupported type", &inst);
@@ -746,6 +893,18 @@ public:
 
   void visitUnreachableInst(UnreachableInst &inst) {
     // do nothing here, waku waku
+  }
+
+  void visitUnaryOperator(UnaryOperator &inst) {
+    switch (inst.getOpcode()) {
+    case Instruction::FNeg:
+      ctx.update_value_map(
+          &inst, -ctx.to_z3_expr(inst.getOperand(0), inst.getFunction()));
+      break;
+    default:
+      ERROR("Unsupported instruction", &inst);
+      break;
+    }
   }
 
   void visitInstruction(Instruction &inst) {
