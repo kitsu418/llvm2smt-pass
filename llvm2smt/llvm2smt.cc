@@ -840,7 +840,14 @@ public:
 
       // little endian
       for (unsigned int i = 0; i < (width + 7) / 8; ++i) {
-        auto byte = val_expr.extract(i * 8 + 7, i * 8);
+        auto byte =
+            width >= i * 8 + 8
+                ? val_expr.extract(i * 8 + 7, i * 8)
+                : (width == 1
+                       ? z3::ite(val_expr, ctx.get_context().bv_val(1, 8),
+                                 ctx.get_context().bv_val(0, 8))
+                       : z3::zext(val_expr.extract(width - 1, i * 8),
+                                  8 - (width - i * 8)));
         ctx.inc_memory_state_num();
         new_memory.push_back(
             ctx.get_context().constant(
